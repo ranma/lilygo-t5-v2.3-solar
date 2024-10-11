@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <cstdio>
+#include <cmath>
 #include <GxEPD2_BW.h>
 #include <LittleFS.h>
 #include <WiFi.h>
-#include <Fonts/FreeSans24pt7b.h>
+#include <ESP32AnalogRead.h>
+#include <Fonts/FreeSans18pt7b.h>
 #include <espMqttClientAsync.h>
 
 #define MAX_DISPLAY_BUFFER_SIZE 65536ul
@@ -16,6 +18,16 @@ SPIClass hspi(HSPI);
 espMqttClientAsync mqttClient;
 
 static RTC_DATA_ATTR int survives_sleep = 0;
+
+static float batteryCurrent = NAN;
+static float batterySoC = NAN;
+static float inverterPower = NAN;
+static float intBatV = NAN;
+static bool dataReady = false;
+static bool goToSleep = false;
+
+constexpr int batPin = 35;
+
 
 extern const uint8_t hostname_start[] asm("_binary_cfg_hostname_start");
 extern const uint8_t hostname_end[] asm("_binary_cfg_hostname_end");
@@ -32,35 +44,36 @@ static String wifi_ssid(wifi_ssid_start, wifi_ssid_end - wifi_ssid_start);
 static String wifi_password(wifi_password_start, wifi_password_end - wifi_password_start);
 static String mqtt_host(mqtt_host_start, mqtt_host_end - mqtt_host_start);
 
-static void fs_init()
+static void fs_init(bool full_init)
 {
 	printf("Initialize FS... ");
 	if (LittleFS.begin(false)) {
 		printf("done\n");
 		return;
 	}
-	printf("failed... trying to format...");
-	if (!LittleFS.begin(true)) {
-		printf("success\n");
-	} else {
-		printf("failed\n");
+	if (full_init) {
+		printf("failed... trying to format...");
+		if (!LittleFS.begin(true)) {
+			printf("success\n");
+			return;
+		}
 	}
+	printf("failed\n");
 }
 
 static void wifi_event_cb(arduino_event_id_t event, arduino_event_info_t info)
 {
     switch (event) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-        printf("WiFi connected\n");
+        printf("[%ld] WiFi connected\n", millis());
         break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         // Reason codes can be found here: https://github.com/espressif/esp-idf/blob/5454d37d496a8c58542eb450467471404c606501/components/esp_wifi/include/esp_wifi_types_generic.h#L79-L141
         printf("WiFi disconnected: %d\n", info.wifi_sta_disconnected.reason);
-        WiFi.disconnect(true, false);
-        WiFi.begin();
+	goToSleep = true;
         break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-        printf("WiFi got ip: %s\n", WiFi.localIP().toString().c_str());
+        printf("[%ld] WiFi got ip: %s\n", millis(), WiFi.localIP().toString().c_str());
         mqttClient.connect();
         break;
     default:
@@ -83,16 +96,49 @@ static void wifi_init()
 	WiFi.begin(wifi_ssid, wifi_password, WIFI_ALL_CHANNEL_SCAN);
 }
 
+constexpr char kMqttBatteryCurrent[] = "solar/battery/current";
+constexpr char kMqttBatterySoC[] = "solar/battery/stateOfCharge";
+constexpr char kMqttInverterPower[] = "solar/ac/power";
+
 void onMqttConnect(bool sessionPresent)
 {
-	printf("Connected to MQTT (%d)\n", sessionPresent);
-	mqttClient.subscribe("solar/battery/stateOfCharge", 0);
-	mqttClient.publish("epaper/test/value", 0, true, "42");
+	printf("[%ld] Connected to MQTT (%d)\n", millis(), sessionPresent);
+	mqttClient.subscribe(kMqttBatteryCurrent, 0);
+	mqttClient.subscribe(kMqttBatterySoC, 0);
+	mqttClient.subscribe(kMqttInverterPower, 0);
+	String rssi(WiFi.RSSI());
+	String batt(intBatV);
+	mqttClient.publish("epaper/sensor/wifi/rssi", 0, true, rssi.c_str());
+	mqttClient.publish("epaper/sensor/battery_voltage/state", 0, true, batt.c_str());
+}
+
+static void dprintf(int x, int y, const GFXfont *font, const char *fmt, ...)
+{
+	char buf[40];
+	va_list ap;
+	display.setCursor(x, y);
+	display.setFont(font);
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	display.print(buf);
 }
 
 void onMqttMessage(const espMqttClientTypes::MessageProperties& properties, const char* topic, const uint8_t* payload, size_t len, size_t index, size_t total) {
 	String data(payload, len);
-	printf("received topic %s: %s\n", topic, data.c_str());
+	printf("[%ld] received topic %s: %s\n", millis(), topic, data.c_str());
+	if (strcmp(topic, kMqttBatteryCurrent) == 0) {
+		batteryCurrent = data.toFloat();
+	} else if (strcmp(topic, kMqttBatterySoC) == 0) {
+		batterySoC = data.toFloat();
+	} else if (strcmp(topic, kMqttInverterPower) == 0) {
+		inverterPower = data.toFloat();
+	}
+	if (isnan(batteryCurrent) || isnan(batterySoC) || isnan(inverterPower)) {
+		return;
+	}
+
+	dataReady = true;
 }
 
 static void mqtt_init()
@@ -104,45 +150,80 @@ static void mqtt_init()
 	mqttClient.setServer(mqtt_host.c_str(), 1883);
 }
 
+static float batVolt()
+{
+	static ESP32AnalogRead adc;
+	static bool initialized = false;
+	if (!initialized) {
+		adc.attach(batPin);
+		initialized = true;
+	}
+	return 2.0 * adc.readVoltage();
+}
+
 void setup()
 {
-	printf("Hello world (wake=%d) s=%d!\n", survives_sleep++, sizeof(display));
-	fs_init();
+	bool full_init = survives_sleep == 0;
+	float temp = temperatureRead();
+	intBatV = batVolt();
+
+	printf("Hello world (wake=%d) bat=%.2fV t=%.1f!\n", survives_sleep++, intBatV, temp);
+	fs_init(full_init);
 	mqtt_init();
 	wifi_init();
-#if 0
 	hspi.begin(/*SCK*/18, /*MISO*/-1, /*MOSI*/23, /*SS*/-1);
-	display.epd2.selectSPI(hspi, SPISettings(4000000, MSBFIRST, SPI_MODE0));
-#else
-	SPI.begin(/*SCK*/18, /*MISO*/-1, /*MOSI*/23, /*SS*/-1);
-#endif
+	display.epd2.selectSPI(hspi, SPISettings(10000000, MSBFIRST, SPI_MODE0));
 
-	bool full_init = survives_sleep < 2;
 	if (!full_init) {
 		printf("skipping full display init!\n");
 	}
 	display.init(115200, full_init);
 	display.setRotation(1);
-	display.setFont(&FreeSans24pt7b);
 	display.setFullWindow();
-	display.firstPage();
-	display.fillScreen(GxEPD_WHITE);
-	display.setTextColor(GxEPD_BLACK);
-	display.setCursor(0, 32);
-	display.printf("Hello %d!", survives_sleep);
-	display.display(!full_init);
-	display.hibernate();
+	if (full_init) {
+		display.firstPage();
+		display.fillScreen(GxEPD_WHITE);
+		display.setTextColor(GxEPD_BLACK);
+		display.setFont(&FreeSans18pt7b);
+		display.setCursor(0, 32);
+		display.printf("Connecting...");
+		display.display();
+	} else {
+		// trigger power-on.
+		display.refresh(true);
+	}
 }
 
 void loop()
 {
 	static int i = 0;
-	printf("Loop%d host=%s ssid=%s\n", i++, hostname.c_str(), wifi_ssid.c_str());
-	delay(1000);
+	if (!(i++ % 10)) {
+		printf("Loop%d host=%s ssid=%s\n", i++, hostname.c_str(), wifi_ssid.c_str());
+	}
+	delay(100);
+	if (dataReady) {
+		float p = (1-(4.1-intBatV)/(4.1-3.3))*100;
+		p = p < 100 ? p : 100;
 
-	if (i >= 10) {
-		esp_sleep_enable_timer_wakeup(10 * 1000000);
-		printf("esp_deep_sleep_start()\n");
+		display.firstPage();
+		display.fillScreen(GxEPD_WHITE);
+		display.setTextColor(GxEPD_BLACK);
+
+		dprintf(0, 4+28, &FreeSans18pt7b, "I: %.0fW", inverterPower);
+		dprintf(0, 4+56, &FreeSans18pt7b, "B: %.0f%%", batterySoC);
+		dprintf(0, 4+84, &FreeSans18pt7b, "%.2fV %.1f%%", intBatV, p);
+
+		display.display(/*partial*/ true);
+		goToSleep = true;
+	}
+	if (goToSleep || i >= 200) {
+		long sleepMillis = 30 * 1000 - millis();
+		printf("[%ld] going to sleep for %ldms\n", millis(), sleepMillis);
+		WiFi.disconnect(true);
+		WiFi.mode(WIFI_OFF);
+		display.hibernate();
+		esp_sleep_enable_timer_wakeup(sleepMillis * 1000);
+		printf("[%ld] esp_deep_sleep_start()\n", millis());
 		esp_deep_sleep_start();
 	}
 }
